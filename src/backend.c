@@ -3017,6 +3017,28 @@ int choose_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, 
   }
   else
   {
+    // innerloop prediction to get a speed estimation is hard, because we don't know in advance how much
+    // time the different kernels take and if their weightnings are equally distributed.
+    // - for instance, a regular _loop kernel is likely to be the slowest, but _loop2 kernel can also be slow.
+    //   in fact, _loop2 can be even slower (see iTunes backup >= 10.0).
+    // - hooks can have a large influence depending on the OS.
+    //   spawning threads and memory allocations take a lot of time on windows (compared to linux).
+    // - the kernel execution can take shortcuts based on intermediate values
+    //   while these intermediate valus depend on input values.
+    // - if we meassure runtimes of different kernels to find out about their weightning
+    //   we need to call them with real input values otherwise we miss the shortcuts inside the kernel.
+    // - the problem is that these real input values could crack the hash which makes the chaos perfect.
+    //
+    // so the innerloop prediction is not perfectly accurate, because we:
+    //
+    // 1. completely ignore hooks and the time they take.
+    // 2. assume that the code in _loop and _loop2 is similar,
+    //    but we respect the different iteration counts in _loop and _loop2.
+    // 3. ignore _comp kernel runtimes (probably irrelevant).
+    //
+    // as soon as the first restore checkpoint is reached the prediction is accurate.
+    // also the closer it gets to that point.
+
     if (true)
     {
       if (device_param->is_cuda == true)
@@ -3160,7 +3182,10 @@ int choose_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, 
              * speed
              */
 
-            const float iter_part = (float) (loop_pos + loop_left) / iter;
+            const u32 iter1r = hashes->salts_buf[salt_pos].salt_iter  * (salt_repeats + 1);
+            const u32 iter2r = hashes->salts_buf[salt_pos].salt_iter2 * (salt_repeats + 1);
+
+            const double iter_part = (double) ((iter * salt_repeat) + loop_pos + loop_left) / (double) (iter1r + iter2r);
 
             const u64 perf_sum_all = (u64) (pws_cnt * iter_part);
 
@@ -3176,7 +3201,7 @@ int choose_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, 
             {
               if (speed_msec > 4000)
               {
-                device_param->outerloop_multi *= (double) iter / (double) (loop_pos + loop_left);
+                device_param->outerloop_multi *= 1 / iter_part;
 
                 device_param->speed_pos = 1;
 
@@ -3295,6 +3320,25 @@ int choose_kernel (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, 
             //bug?
             //while (status_ctx->run_thread_level2 == false) break;
             if (status_ctx->run_thread_level2 == false) break;
+
+            /**
+             * speed
+             */
+
+            const u32 iter1r = hashes->salts_buf[salt_pos].salt_iter  * (salt_repeats + 1);
+            const u32 iter2r = hashes->salts_buf[salt_pos].salt_iter2 * (salt_repeats + 1);
+
+            const double iter_part = (double) (iter1r + (iter * salt_repeat) + loop_pos + loop_left) / (double) (iter1r + iter2r);
+
+            const u64 perf_sum_all = (u64) (pws_cnt * iter_part);
+
+            double speed_msec = hc_timer_get (device_param->timer_speed);
+
+            const u32 speed_pos = device_param->speed_pos;
+
+            device_param->speed_cnt[speed_pos] = perf_sum_all;
+
+            device_param->speed_msec[speed_pos] = speed_msec;
           }
         }
       }
@@ -5113,12 +5157,13 @@ int backend_ctx_init (hashcat_ctx_t *hashcat_ctx)
 
   backend_ctx->enabled = false;
 
-  if (user_options->hash_info      == true) return 0;
-  if (user_options->keyspace       == true) return 0;
-  if (user_options->left           == true) return 0;
-  if (user_options->show           == true) return 0;
-  if (user_options->usage          == true) return 0;
-  if (user_options->version        == true) return 0;
+  if (user_options->hash_info == true) return 0;
+  if (user_options->keyspace  == true) return 0;
+  if (user_options->left      == true) return 0;
+  if (user_options->show      == true) return 0;
+  if (user_options->usage     == true) return 0;
+  if (user_options->version   == true) return 0;
+  if (user_options->identify  == true) return 0;
 
   hc_device_param_t *devices_param = (hc_device_param_t *) hccalloc (DEVICES_MAX, sizeof (hc_device_param_t));
 
@@ -8631,28 +8676,10 @@ int backend_session_begin (hashcat_ctx_t *hashcat_ctx)
     #endif
 
     /**
-     * device_name_chksum
+     * device_name_chksum_amp_mp
      */
 
-    char *device_name_chksum        = (char *) hcmalloc (HCBUFSIZ_TINY);
     char *device_name_chksum_amp_mp = (char *) hcmalloc (HCBUFSIZ_TINY);
-
-    // The kernel source can depend on some JiT compiler macros which themself depend on the attack_modes.
-    // ATM this is relevant only for ATTACK_MODE_ASSOCIATION which slightly modifies ATTACK_MODE_STRAIGHT kernels.
-
-    const u32 extra_value = (user_options->attack_mode == ATTACK_MODE_ASSOCIATION) ? ATTACK_MODE_ASSOCIATION : ATTACK_MODE_NONE;
-
-    const size_t dnclen = snprintf (device_name_chksum, HCBUFSIZ_TINY, "%d-%d-%d-%u-%s-%s-%s-%d-%u-%u",
-      backend_ctx->comptime,
-      backend_ctx->cuda_driver_version,
-      device_param->is_opencl,
-      device_param->opencl_platform_vendor_id,
-      device_param->device_name,
-      device_param->opencl_device_version,
-      device_param->opencl_driver_version,
-      device_param->vector_width,
-      hashconfig->kern_type,
-      extra_value);
 
     const size_t dnclen_amp_mp = snprintf (device_name_chksum_amp_mp, HCBUFSIZ_TINY, "%d-%d-%d-%u-%s-%s-%s",
       backend_ctx->comptime,
@@ -8664,12 +8691,6 @@ int backend_session_begin (hashcat_ctx_t *hashcat_ctx)
       device_param->opencl_driver_version);
 
     md5_ctx_t md5_ctx;
-
-    md5_init   (&md5_ctx);
-    md5_update (&md5_ctx, (u32 *) device_name_chksum, dnclen);
-    md5_final  (&md5_ctx);
-
-    snprintf (device_name_chksum, HCBUFSIZ_TINY, "%08x", md5_ctx.h[0]);
 
     md5_init   (&md5_ctx);
     md5_update (&md5_ctx, (u32 *) device_name_chksum_amp_mp, dnclen_amp_mp);
@@ -8890,6 +8911,38 @@ int backend_session_begin (hashcat_ctx_t *hashcat_ctx)
       #endif
 
       /**
+       * device_name_chksum
+       */
+
+      char *device_name_chksum = (char *) hcmalloc (HCBUFSIZ_TINY);
+
+      // The kernel source can depend on some JiT compiler macros which themself depend on the attack_modes.
+      // ATM this is relevant only for ATTACK_MODE_ASSOCIATION which slightly modifies ATTACK_MODE_STRAIGHT kernels.
+
+      const u32 extra_value = (user_options->attack_mode == ATTACK_MODE_ASSOCIATION) ? ATTACK_MODE_ASSOCIATION : ATTACK_MODE_NONE;
+
+      const size_t dnclen = snprintf (device_name_chksum, HCBUFSIZ_TINY, "%d-%d-%d-%u-%s-%s-%s-%d-%u-%u-%s",
+        backend_ctx->comptime,
+        backend_ctx->cuda_driver_version,
+        device_param->is_opencl,
+        device_param->opencl_platform_vendor_id,
+        device_param->device_name,
+        device_param->opencl_device_version,
+        device_param->opencl_driver_version,
+        device_param->vector_width,
+        hashconfig->kern_type,
+        extra_value,
+        build_options_module_buf);
+
+      md5_ctx_t md5_ctx;
+
+      md5_init   (&md5_ctx);
+      md5_update (&md5_ctx, (u32 *) device_name_chksum, dnclen);
+      md5_final  (&md5_ctx);
+
+      snprintf (device_name_chksum, HCBUFSIZ_TINY, "%08x", md5_ctx.h[0]);
+
+      /**
        * kernel source filename
        */
 
@@ -8926,6 +8979,8 @@ int backend_session_begin (hashcat_ctx_t *hashcat_ctx)
       }
 
       hcfree (build_options_module_buf);
+
+      hcfree (device_name_chksum);
     }
 
     /**
@@ -9037,7 +9092,6 @@ int backend_session_begin (hashcat_ctx_t *hashcat_ctx)
       if (hc_clUnloadPlatformCompiler (hashcat_ctx, platform_id) == -1) return -1;
     }
 
-    hcfree (device_name_chksum);
     hcfree (device_name_chksum_amp_mp);
 
     // some algorithm collide too fast, make that impossible
